@@ -1,8 +1,13 @@
-export type RegistrationStep = "idle" | "awaiting_team_name" | "awaiting_logo";
+export type RegistrationStep =
+  | "idle"
+  | "awaiting_team_name"
+  | "awaiting_username"
+  | "awaiting_logo";
 
 export interface UserState {
   step: RegistrationStep;
   teamName?: string;
+  telegramUsername?: string;
 }
 
 const states = new Map<number, UserState>();

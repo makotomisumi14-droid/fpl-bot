@@ -11,6 +11,7 @@ if (!token) throw new Error("TELEGRAM_BOT_TOKEN is required");
 if (!adminId) throw new Error("ADMIN_TELEGRAM_ID is required");
 
 const ADMIN_ID = Number(adminId);
+const SQUAD_ADMIN = "@Mayra_372";
 const botToken: string = token;
 
 // Singleton bot instance — webhook mode, no polling
@@ -84,12 +85,46 @@ function registerHandlers(bot: TelegramBot) {
       reg.status === "approved" ? "✅" : reg.status === "rejected" ? "❌" : "⏳";
     await bot.sendMessage(
       chatId,
-      `${statusEmoji} *Registration Status*\n\n👥 Team: *${reg.teamName}*\nStatus: *${reg.status.toUpperCase()}*`,
+      `${statusEmoji} *Registration Status*\n\n👥 Team: *${reg.teamName}*\n👤 Username: @${reg.telegramUsername ?? "N/A"}\nStatus: *${reg.status.toUpperCase()}*`,
       { parse_mode: "Markdown" }
     );
   });
 
-  // /admin command — admin only, lists all registrations
+  // /listteams command — shows all approved teams (admin only)
+  bot.onText(/\/listteams/, async (msg) => {
+    const chatId = msg.chat.id;
+    const userId = msg.from?.id;
+    if (!userId || userId !== ADMIN_ID) {
+      await bot.sendMessage(chatId, "⛔ This command is for admins only.");
+      return;
+    }
+
+    const approved = await db
+      .select()
+      .from(registrationsTable)
+      .where(eq(registrationsTable.status, "approved"))
+      .orderBy(registrationsTable.createdAt);
+
+    if (approved.length === 0) {
+      await bot.sendMessage(chatId, "📋 No approved teams yet.");
+      return;
+    }
+
+    const teamList = approved
+      .map(
+        (r, i) =>
+          `${i + 1}. 🏏 *${r.teamName}*\n    👤 @${r.telegramUsername ?? "N/A"} | ID: \`${r.telegramUserId}\``
+      )
+      .join("\n\n");
+
+    await bot.sendMessage(
+      chatId,
+      `✅ *Approved Teams (${approved.length})*\n\n${teamList}`,
+      { parse_mode: "Markdown" }
+    );
+  });
+
+  // /admin command — admin only, lists all registrations with approve/reject buttons
   bot.onText(/\/admin/, async (msg) => {
     const chatId = msg.chat.id;
     const userId = msg.from?.id;
@@ -162,20 +197,42 @@ function registerHandlers(bot: TelegramBot) {
 
     const state = getState(userId);
 
+    // Step 1: Team name
     if (state.step === "awaiting_team_name") {
       if (!msg.text || msg.text.trim().length < 2) {
         await bot.sendMessage(chatId, "Please enter a valid team name (at least 2 characters).");
         return;
       }
-      setState(userId, { step: "awaiting_logo", teamName: msg.text.trim() });
+      setState(userId, { step: "awaiting_username", teamName: msg.text.trim() });
       await bot.sendMessage(
         chatId,
-        `Great! Team name: *${msg.text.trim()}*\n\nNow please send your *team logo* as a photo 📸`,
+        `Great! Team name: *${msg.text.trim()}*\n\nNow please enter your *Telegram username* (e.g. @YourName):`,
         { parse_mode: "Markdown" }
       );
       return;
     }
 
+    // Step 2: Telegram username
+    if (state.step === "awaiting_username") {
+      if (!msg.text || msg.text.trim().length < 2) {
+        await bot.sendMessage(chatId, "Please enter a valid Telegram username.");
+        return;
+      }
+      const rawUsername = msg.text.trim().replace(/^@/, "");
+      setState(userId, {
+        step: "awaiting_logo",
+        teamName: state.teamName,
+        telegramUsername: rawUsername,
+      });
+      await bot.sendMessage(
+        chatId,
+        `Got it! Username: *@${rawUsername}*\n\nNow please send your *team logo* as a photo 📸`,
+        { parse_mode: "Markdown" }
+      );
+      return;
+    }
+
+    // Step 3: Logo photo
     if (state.step === "awaiting_logo") {
       if (!msg.photo || msg.photo.length === 0) {
         await bot.sendMessage(chatId, "Please send your team logo as a *photo* image.", {
@@ -186,8 +243,8 @@ function registerHandlers(bot: TelegramBot) {
 
       const photo = msg.photo[msg.photo.length - 1];
       const fileId = photo.file_id;
-      const username = msg.from?.username ?? null;
       const teamName = state.teamName!;
+      const username = state.telegramUsername ?? msg.from?.username ?? null;
 
       try {
         await db.insert(registrationsTable).values({
@@ -274,9 +331,16 @@ function registerHandlers(bot: TelegramBot) {
         { chat_id: adminChatId, message_id: query.message?.message_id }
       );
 
+      // Approval message + squad instructions
       await bot.sendMessage(
         targetUserId,
-        `🎉 *Congratulations!* Your FPL Cricket League captain registration has been *approved*!\n\nWelcome to the league. Get ready to lead your team to victory! 🏆`,
+        `🎉 *Congratulations! Your registration has been APPROVED!*\n\nWelcome to *FPL Cricket League* as an official Captain! 🏏🏆\n\n` +
+        `📋 *Next Step — Submit Your Squad*\n\n` +
+        `Please make your squad of *12 players* and send it to the league admin:\n👉 ${SQUAD_ADMIN}\n\n` +
+        `Your squad should include:\n` +
+        `• Player names\n` +
+        `• Their roles (Batsman / Bowler / All-rounder / Wicket-keeper)\n\n` +
+        `Good luck! 🌟`,
         { parse_mode: "Markdown" }
       );
     } else if (action === "reject") {
