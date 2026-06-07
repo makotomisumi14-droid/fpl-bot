@@ -15,47 +15,33 @@ if (Number.isNaN(port) || port <= 0) {
   throw new Error(`Invalid PORT value: "${rawPort}"`);
 }
 
+// On Replit (dev), don't touch the webhook — Railway owns it
+const isRailway = Boolean(process.env["WEBHOOK_URL"]);
+const isReplit = Boolean(process.env["REPLIT_DOMAINS"]);
+
 app.listen(port, async (err) => {
   if (err) {
     logger.error({ err }, "Error listening on port");
     process.exit(1);
   }
 
-  logger.info({ port }, "Server listening");
+  logger.info({ port, isRailway, isReplit }, "Server listening");
 
-  // Auto-create tables on startup (works on Railway and Replit)
+  // Auto-create DB tables on startup
   try {
     await runMigrations();
     logger.info("Database migrations completed");
   } catch (migErr) {
-    logger.error({ err: migErr }, "Database migration failed");
+    logger.error({ err: migErr }, "Database migration failed — bot may not work");
   }
 
-  // Initialise bot in webhook mode
-  const bot = startBot();
+  // Only start bot + register webhook on Railway
+  // On Replit dev server, leave Railway's webhook alone
+  if (!isRailway && isReplit) {
+    logger.info("Running on Replit dev — skipping webhook registration (Railway owns it)");
 
-  // Determine webhook URL — Railway sets WEBHOOK_URL, Replit sets REPLIT_DOMAINS
-  const webhookUrl =
-    process.env["WEBHOOK_URL"] ??
-    (process.env["REPLIT_DOMAINS"]
-      ? `https://${process.env["REPLIT_DOMAINS"].split(",")[0]}/api/telegram-webhook`
-      : null);
-
-  if (!webhookUrl) {
-    logger.error("No webhook URL available — set WEBHOOK_URL or REPLIT_DOMAINS");
-    return;
-  }
-
-  try {
-    await bot.setWebHook(webhookUrl);
-    logger.info({ webhookUrl }, "Telegram webhook registered");
-  } catch (webhookErr) {
-    logger.error({ err: webhookErr }, "Failed to register Telegram webhook");
-  }
-
-  // Keep-alive ping (only needed on Replit)
-  if (process.env["REPLIT_DOMAINS"]) {
-    const keepAliveUrl = `https://${process.env["REPLIT_DOMAINS"].split(",")[0]}/api/healthz`;
+    // Keep-alive ping so Replit doesn't sleep (useful while testing locally)
+    const keepAliveUrl = `https://${process.env["REPLIT_DOMAINS"]!.split(",")[0]}/api/healthz`;
     setInterval(async () => {
       try {
         const res = await fetch(keepAliveUrl);
@@ -64,6 +50,17 @@ app.listen(port, async (err) => {
         logger.warn({ err: pingErr }, "Keep-alive ping failed");
       }
     }, 4 * 60 * 1000);
-    logger.info({ keepAliveUrl }, "Keep-alive pinger started");
+    return;
+  }
+
+  // Railway: start bot + register webhook
+  const bot = startBot();
+  const webhookUrl = process.env["WEBHOOK_URL"]!;
+
+  try {
+    await bot.setWebHook(webhookUrl);
+    logger.info({ webhookUrl }, "Telegram webhook registered");
+  } catch (webhookErr) {
+    logger.error({ err: webhookErr }, "Failed to register Telegram webhook");
   }
 });
