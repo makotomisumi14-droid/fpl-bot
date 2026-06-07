@@ -205,6 +205,53 @@ function registerHandlers(bot: TelegramBot) {
     }
   });
 
+  // /announce command — admin only, broadcasts to all approved captains
+  bot.onText(/\/announce (.+)/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    const userId = msg.from?.id;
+    if (!userId || userId !== ADMIN_ID) {
+      await bot.sendMessage(chatId, "⛔ This command is for admins only.");
+      return;
+    }
+
+    const announcement = match?.[1]?.trim();
+    if (!announcement) {
+      await bot.sendMessage(chatId, "Usage: /announce Your message here");
+      return;
+    }
+
+    const approved = await db
+      .select()
+      .from(registrationsTable)
+      .where(eq(registrationsTable.status, "approved"));
+
+    if (approved.length === 0) {
+      await bot.sendMessage(chatId, "📋 No approved captains to announce to yet.");
+      return;
+    }
+
+    let sent = 0;
+    let failed = 0;
+    for (const captain of approved) {
+      try {
+        await bot.sendMessage(
+          Number(captain.telegramUserId),
+          `📢 *FPL Cricket League — Announcement*\n\n${announcement}`,
+          { parse_mode: "Markdown" }
+        );
+        sent++;
+      } catch {
+        failed++;
+      }
+    }
+
+    await bot.sendMessage(
+      chatId,
+      `✅ Announcement sent!\n\n📤 Delivered: *${sent}* captain(s)${failed > 0 ? `\n❌ Failed: *${failed}* (they may have blocked the bot)` : ""}`,
+      { parse_mode: "Markdown" }
+    );
+  });
+
   // /cancel command
   bot.onText(/\/cancel/, async (msg) => {
     const chatId = msg.chat.id;
