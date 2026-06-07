@@ -14,6 +14,9 @@ const ADMIN_ID = Number(adminId);
 const SQUAD_ADMIN = "@Mayra_372";
 const botToken: string = token;
 
+const REGISTRATION_DEADLINE = new Date("2026-06-13T23:59:59+05:30"); // IST midnight
+const MAX_CAPTAINS = 10;
+
 // Singleton bot instance — webhook mode, no polling
 let botInstance: TelegramBot | null = null;
 
@@ -52,6 +55,30 @@ function registerHandlers(bot: TelegramBot) {
             ? "❌ Your registration was *rejected*. Contact the admin for more info."
             : "⏳ Your registration is *pending* admin approval. Please wait.";
       await bot.sendMessage(chatId, statusMsg, { parse_mode: "Markdown" });
+      return;
+    }
+
+    // Check deadline
+    if (new Date() > REGISTRATION_DEADLINE) {
+      await bot.sendMessage(
+        chatId,
+        `⏰ *Registrations are closed!*\n\nThe deadline was *13 June 2026*. No more captains can register.\n\nContact the admin for more information.`,
+        { parse_mode: "Markdown" }
+      );
+      return;
+    }
+
+    // Check captain limit
+    const approvedCount = await db
+      .select()
+      .from(registrationsTable)
+      .where(eq(registrationsTable.status, "approved"));
+    if (approvedCount.length >= MAX_CAPTAINS) {
+      await bot.sendMessage(
+        chatId,
+        `🚫 *Registrations are full!*\n\nAll *${MAX_CAPTAINS} captain spots* have been filled. No more registrations are being accepted.\n\nContact the admin for more information.`,
+        { parse_mode: "Markdown" }
+      );
       return;
     }
 
