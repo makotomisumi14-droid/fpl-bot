@@ -1,6 +1,7 @@
 import app from "./app";
 import { logger } from "./lib/logger";
 import { startBot } from "./bot";
+import { runMigrations } from "@workspace/db";
 
 const rawPort = process.env["PORT"];
 
@@ -22,17 +23,29 @@ app.listen(port, async (err) => {
 
   logger.info({ port }, "Server listening");
 
+  // Auto-create tables on startup (works on Railway and Replit)
+  try {
+    await runMigrations();
+    logger.info("Database migrations completed");
+  } catch (migErr) {
+    logger.error({ err: migErr }, "Database migration failed");
+  }
+
   // Initialise bot in webhook mode
   const bot = startBot();
 
-  // Register webhook with Telegram
-  const domain = process.env["REPLIT_DOMAINS"]?.split(",")[0];
-  if (!domain) {
-    logger.error("REPLIT_DOMAINS not set — cannot register Telegram webhook");
+  // Determine webhook URL — Railway sets WEBHOOK_URL, Replit sets REPLIT_DOMAINS
+  const webhookUrl =
+    process.env["WEBHOOK_URL"] ??
+    (process.env["REPLIT_DOMAINS"]
+      ? `https://${process.env["REPLIT_DOMAINS"].split(",")[0]}/api/telegram-webhook`
+      : null);
+
+  if (!webhookUrl) {
+    logger.error("No webhook URL available — set WEBHOOK_URL or REPLIT_DOMAINS");
     return;
   }
 
-  const webhookUrl = `https://${domain}/api/telegram-webhook`;
   try {
     await bot.setWebHook(webhookUrl);
     logger.info({ webhookUrl }, "Telegram webhook registered");
@@ -40,16 +53,17 @@ app.listen(port, async (err) => {
     logger.error({ err: webhookErr }, "Failed to register Telegram webhook");
   }
 
-  // Keep-alive: ping the health endpoint every 4 minutes so Replit never sleeps
-  const keepAliveUrl = `https://${domain}/api/healthz`;
-  setInterval(async () => {
-    try {
-      const res = await fetch(keepAliveUrl);
-      logger.info({ status: res.status }, "Keep-alive ping sent");
-    } catch (pingErr) {
-      logger.warn({ err: pingErr }, "Keep-alive ping failed");
-    }
-  }, 4 * 60 * 1000); // every 4 minutes
-
-  logger.info({ keepAliveUrl }, "Keep-alive pinger started");
+  // Keep-alive ping (only needed on Replit)
+  if (process.env["REPLIT_DOMAINS"]) {
+    const keepAliveUrl = `https://${process.env["REPLIT_DOMAINS"].split(",")[0]}/api/healthz`;
+    setInterval(async () => {
+      try {
+        const res = await fetch(keepAliveUrl);
+        logger.info({ status: res.status }, "Keep-alive ping sent");
+      } catch (pingErr) {
+        logger.warn({ err: pingErr }, "Keep-alive ping failed");
+      }
+    }, 4 * 60 * 1000);
+    logger.info({ keepAliveUrl }, "Keep-alive pinger started");
+  }
 });

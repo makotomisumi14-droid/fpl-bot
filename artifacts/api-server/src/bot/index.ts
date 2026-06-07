@@ -1,5 +1,5 @@
 import TelegramBot from "node-telegram-bot-api";
-import { db, registrationsTable } from "@workspace/db";
+import { db, registrationsTable, settingsTable } from "@workspace/db";
 import { eq } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { getState, setState, clearState } from "./states";
@@ -14,8 +14,48 @@ const ADMIN_ID = Number(adminId);
 const SQUAD_ADMIN = "@Mayra_372";
 const botToken: string = token;
 
-const REGISTRATION_DEADLINE = new Date("2026-06-13T23:59:59+05:30"); // IST midnight
+const REGISTRATION_DEADLINE = new Date("2026-06-13T23:59:59+05:30");
 const MAX_CAPTAINS = 10;
+
+// --- Group chat ID helpers (persisted in DB settings table) ---
+async function getGroupChatId(): Promise<number | null> {
+  const row = await db
+    .select()
+    .from(settingsTable)
+    .where(eq(settingsTable.key, "group_chat_id"))
+    .limit(1);
+  return row.length > 0 ? Number(row[0].value) : null;
+}
+
+async function setGroupChatId(chatId: number): Promise<void> {
+  await db
+    .insert(settingsTable)
+    .values({ key: "group_chat_id", value: String(chatId) })
+    .onConflictDoUpdate({ target: settingsTable.key, set: { value: String(chatId) } });
+}
+
+// Send a message to the group (silently fails if no group set)
+async function notifyGroup(bot: TelegramBot, text: string, options: TelegramBot.SendMessageOptions = {}): Promise<TelegramBot.Message | null> {
+  const groupId = await getGroupChatId();
+  if (!groupId) return null;
+  try {
+    return await bot.sendMessage(groupId, text, options);
+  } catch (err) {
+    logger.warn({ err }, "Could not send message to group");
+    return null;
+  }
+}
+
+async function notifyGroupPhoto(bot: TelegramBot, fileId: string, options: TelegramBot.SendPhotoOptions = {}): Promise<TelegramBot.Message | null> {
+  const groupId = await getGroupChatId();
+  if (!groupId) return null;
+  try {
+    return await bot.sendPhoto(groupId, fileId, options);
+  } catch (err) {
+    logger.warn({ err }, "Could not send photo to group");
+    return null;
+  }
+}
 
 // Singleton bot instance — webhook mode, no polling
 let botInstance: TelegramBot | null = null;
@@ -39,6 +79,7 @@ function registerHandlers(bot: TelegramBot) {
     const chatId = msg.chat.id;
     const userId = msg.from?.id;
     if (!userId) return;
+    if (msg.chat.type !== "private") return;
 
     const existing = await db
       .select()
@@ -76,7 +117,7 @@ function registerHandlers(bot: TelegramBot) {
     if (approvedCount.length >= MAX_CAPTAINS) {
       await bot.sendMessage(
         chatId,
-        `🚫 *Registrations are full!*\n\nAll *${MAX_CAPTAINS} captain spots* have been filled. No more registrations are being accepted.\n\nContact the admin for more information.`,
+        `🚫 *Registrations are full!*\n\nAll *${MAX_CAPTAINS} captain spots* have been filled.\n\nContact the admin for more information.`,
         { parse_mode: "Markdown" }
       );
       return;
@@ -95,6 +136,7 @@ function registerHandlers(bot: TelegramBot) {
     const chatId = msg.chat.id;
     const userId = msg.from?.id;
     if (!userId) return;
+    if (msg.chat.type !== "private") return;
 
     const existing = await db
       .select()
@@ -117,7 +159,35 @@ function registerHandlers(bot: TelegramBot) {
     );
   });
 
-  // /listteams command — shows all approved teams (admin only)
+  // /setgroup command — admin sends this inside a group to connect it
+  bot.onText(/\/setgroup/, async (msg) => {
+    const chatId = msg.chat.id;
+    const userId = msg.from?.id;
+    if (!userId || userId !== ADMIN_ID) {
+      await bot.sendMessage(chatId, "⛔ Only the league admin can use this command.");
+      return;
+    }
+    if (msg.chat.type === "private") {
+      await bot.sendMessage(chatId, "⚠️ Use this command inside the *group* you want to connect — not here in DM.", { parse_mode: "Markdown" });
+      return;
+    }
+    await setGroupChatId(chatId);
+    await bot.sendMessage(
+      chatId,
+      `✅ *Group connected!*\n\nThis group will now receive all FPL Cricket League registration alerts and announcements. 🏏`,
+      { parse_mode: "Markdown" }
+    );
+    // Also confirm to admin in DM
+    try {
+      await bot.sendMessage(
+        ADMIN_ID,
+        `✅ Group *"${msg.chat.title}"* has been connected.\n\nAll new registration alerts will appear there too.`,
+        { parse_mode: "Markdown" }
+      );
+    } catch { /* admin DM may fail if not started */ }
+  });
+
+  // /listteams command — admin only
   bot.onText(/\/listteams/, async (msg) => {
     const chatId = msg.chat.id;
     const userId = msg.from?.id;
@@ -151,7 +221,7 @@ function registerHandlers(bot: TelegramBot) {
     );
   });
 
-  // /admin command — admin only, lists all registrations with approve/reject buttons
+  // /admin command — lists all registrations with approve/reject buttons
   bot.onText(/\/admin/, async (msg) => {
     const chatId = msg.chat.id;
     const userId = msg.from?.id;
@@ -173,10 +243,7 @@ function registerHandlers(bot: TelegramBot) {
 
     const formatList = (items: typeof all) =>
       items
-        .map(
-          (r, i) =>
-            `${i + 1}. *${r.teamName}* — @${r.telegramUsername ?? "N/A"} \`(${r.telegramUserId})\``
-        )
+        .map((r, i) => `${i + 1}. *${r.teamName}* — @${r.telegramUsername ?? "N/A"} \`(${r.telegramUserId})\``)
         .join("\n");
 
     let text = `📋 *FPL League Registrations*\n\n`;
@@ -193,19 +260,17 @@ function registerHandlers(bot: TelegramBot) {
         {
           parse_mode: "Markdown",
           reply_markup: {
-            inline_keyboard: [
-              [
-                { text: "✅ Approve", callback_data: `approve_${r.telegramUserId}` },
-                { text: "❌ Reject", callback_data: `reject_${r.telegramUserId}` },
-              ],
-            ],
+            inline_keyboard: [[
+              { text: "✅ Approve", callback_data: `approve_${r.telegramUserId}` },
+              { text: "❌ Reject", callback_data: `reject_${r.telegramUserId}` },
+            ]],
           },
         }
       );
     }
   });
 
-  // /announce command — admin only, broadcasts to all approved captains
+  // /announce command — broadcasts to all approved captains
   bot.onText(/\/announce (.+)/, async (msg, match) => {
     const chatId = msg.chat.id;
     const userId = msg.from?.id;
@@ -245,6 +310,12 @@ function registerHandlers(bot: TelegramBot) {
       }
     }
 
+    // Also post to group
+    await notifyGroup(bot,
+      `📢 *FPL Cricket League — Announcement*\n\n${announcement}`,
+      { parse_mode: "Markdown" }
+    );
+
     await bot.sendMessage(
       chatId,
       `✅ Announcement sent!\n\n📤 Delivered: *${sent}* captain(s)${failed > 0 ? `\n❌ Failed: *${failed}* (they may have blocked the bot)` : ""}`,
@@ -257,16 +328,17 @@ function registerHandlers(bot: TelegramBot) {
     const chatId = msg.chat.id;
     const userId = msg.from?.id;
     if (!userId) return;
+    if (msg.chat.type !== "private") return;
     clearState(userId);
     await bot.sendMessage(chatId, "Registration cancelled. Use /start to begin again.");
   });
 
-  // Handle all messages for conversation flow
+  // Handle all messages for conversation flow (private chats only)
   bot.on("message", async (msg) => {
     const chatId = msg.chat.id;
     const userId = msg.from?.id;
     if (!userId) return;
-
+    if (msg.chat.type !== "private") return;
     if (msg.text?.startsWith("/")) return;
 
     const state = getState(userId);
@@ -293,11 +365,7 @@ function registerHandlers(bot: TelegramBot) {
         return;
       }
       const rawUsername = msg.text.trim().replace(/^@/, "");
-      setState(userId, {
-        step: "awaiting_logo",
-        teamName: state.teamName,
-        telegramUsername: rawUsername,
-      });
+      setState(userId, { step: "awaiting_logo", teamName: state.teamName, telegramUsername: rawUsername });
       await bot.sendMessage(
         chatId,
         `Got it! Username: *@${rawUsername}*\n\nNow please send your *team logo* as a photo 📸`,
@@ -309,9 +377,7 @@ function registerHandlers(bot: TelegramBot) {
     // Step 3: Logo photo
     if (state.step === "awaiting_logo") {
       if (!msg.photo || msg.photo.length === 0) {
-        await bot.sendMessage(chatId, "Please send your team logo as a *photo* image.", {
-          parse_mode: "Markdown",
-        });
+        await bot.sendMessage(chatId, "Please send your team logo as a *photo* image.", { parse_mode: "Markdown" });
         return;
       }
 
@@ -344,25 +410,31 @@ function registerHandlers(bot: TelegramBot) {
           `🏏 Team: *${teamName}*\n\n` +
           `Use the buttons below to approve or reject:`;
 
+        const approveRejectMarkup: TelegramBot.InlineKeyboardMarkup = {
+          inline_keyboard: [[
+            { text: "✅ Approve", callback_data: `approve_${userId}` },
+            { text: "❌ Reject", callback_data: `reject_${userId}` },
+          ]],
+        };
+
+        // Notify admin DM
         await bot.sendPhoto(ADMIN_ID, fileId, {
           caption: captionText,
           parse_mode: "Markdown",
-          reply_markup: {
-            inline_keyboard: [
-              [
-                { text: "✅ Approve", callback_data: `approve_${userId}` },
-                { text: "❌ Reject", callback_data: `reject_${userId}` },
-              ],
-            ],
-          },
+          reply_markup: approveRejectMarkup,
         });
+
+        // Notify group (with logo + approve/reject buttons so admin can act from group too)
+        await notifyGroupPhoto(bot, fileId, {
+          caption: captionText,
+          parse_mode: "Markdown",
+          reply_markup: approveRejectMarkup,
+        });
+
       } catch (err: any) {
         if (err?.code === "23505" || (err?.message ?? "").includes("unique")) {
           clearState(userId);
-          await bot.sendMessage(
-            chatId,
-            "You have already submitted a registration. Use /status to check your status."
-          );
+          await bot.sendMessage(chatId, "You have already submitted a registration. Use /status to check your status.");
         } else {
           logger.error({ err }, "Failed to save registration");
           await bot.sendMessage(chatId, "Something went wrong. Please try again later.");
@@ -372,17 +444,16 @@ function registerHandlers(bot: TelegramBot) {
     }
 
     if (state.step === "idle") {
-      await bot.sendMessage(
-        chatId,
-        "Use /start to register as a captain or /status to check your registration."
-      );
+      await bot.sendMessage(chatId, "Use /start to register as a captain or /status to check your registration.");
     }
   });
 
-  // Handle admin approve/reject callbacks
+  // Handle admin approve/reject callbacks (works from DM or group)
   bot.on("callback_query", async (query) => {
-    const adminChatId = query.message?.chat.id;
-    if (!adminChatId || adminChatId !== ADMIN_ID) {
+    const callbackChatId = query.message?.chat.id;
+    const userId = query.from.id;
+
+    if (!callbackChatId || userId !== ADMIN_ID) {
       await bot.answerCallbackQuery(query.id, { text: "Unauthorized" });
       return;
     }
@@ -399,13 +470,24 @@ function registerHandlers(bot: TelegramBot) {
         .set({ status: "approved" })
         .where(eq(registrationsTable.telegramUserId, String(targetUserId)));
 
-      await bot.answerCallbackQuery(query.id, { text: "Approved!" });
+      await bot.answerCallbackQuery(query.id, { text: "✅ Approved!" });
       await bot.editMessageReplyMarkup(
         { inline_keyboard: [[{ text: "✅ Approved", callback_data: "done" }]] },
-        { chat_id: adminChatId, message_id: query.message?.message_id }
+        { chat_id: callbackChatId, message_id: query.message?.message_id }
       );
 
-      // Approval message + squad instructions
+      // Get team info for group notification
+      const reg = await db.select().from(registrationsTable).where(eq(registrationsTable.telegramUserId, String(targetUserId))).limit(1);
+      const teamName = reg[0]?.teamName ?? "Unknown";
+      const username = reg[0]?.telegramUsername ?? "N/A";
+
+      // Notify group
+      await notifyGroup(bot,
+        `✅ *Captain Approved!*\n\n👤 @${username}\n🏏 Team: *${teamName}*`,
+        { parse_mode: "Markdown" }
+      );
+
+      // Message to captain
       await bot.sendMessage(
         targetUserId,
         `🎉 *Congratulations! Your registration has been APPROVED!*\n\nWelcome to *FPL Cricket League* as an official Captain! 🏏🏆\n\n` +
@@ -417,16 +499,28 @@ function registerHandlers(bot: TelegramBot) {
         `Good luck! 🌟`,
         { parse_mode: "Markdown" }
       );
+
     } else if (action === "reject") {
       await db
         .update(registrationsTable)
         .set({ status: "rejected" })
         .where(eq(registrationsTable.telegramUserId, String(targetUserId)));
 
-      await bot.answerCallbackQuery(query.id, { text: "Rejected." });
+      await bot.answerCallbackQuery(query.id, { text: "❌ Rejected." });
       await bot.editMessageReplyMarkup(
         { inline_keyboard: [[{ text: "❌ Rejected", callback_data: "done" }]] },
-        { chat_id: adminChatId, message_id: query.message?.message_id }
+        { chat_id: callbackChatId, message_id: query.message?.message_id }
+      );
+
+      // Get team info for group notification
+      const reg = await db.select().from(registrationsTable).where(eq(registrationsTable.telegramUserId, String(targetUserId))).limit(1);
+      const teamName = reg[0]?.teamName ?? "Unknown";
+      const username = reg[0]?.telegramUsername ?? "N/A";
+
+      // Notify group
+      await notifyGroup(bot,
+        `❌ *Registration Rejected*\n\n👤 @${username}\n🏏 Team: *${teamName}*`,
+        { parse_mode: "Markdown" }
       );
 
       await bot.sendMessage(
